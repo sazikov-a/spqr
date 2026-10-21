@@ -5272,6 +5272,24 @@ func TestXProtoPureVirtual(t *testing.T) {
 		_ = conn.Close()
 	}()
 
+	// Use the multi-shard fixture, or always_check_rules: true with a single
+	// shard, so these regressions exercise SPQR's virtual planner rather than
+	// the single-shard shortcut to PostgreSQL.
+	field := func(name string, oid uint32, size, format int16) pgproto3.FieldDescription {
+		return pgproto3.FieldDescription{
+			Name: []byte(name), DataTypeOID: oid, DataTypeSize: size,
+			TypeModifier: -1, Format: format,
+		}
+	}
+	intText := field("?column?", catalog.INT4OID, 4, 0)
+	intBinary := field("?column?", catalog.INT4OID, 4, 1)
+	boolText := field("pg_is_in_recovery", catalog.BOOLOID, 1, 0)
+	boolBinary := field("pg_is_in_recovery", catalog.BOOLOID, 1, 1)
+	textText := field("?column?", catalog.TEXTOID, -1, 0)
+	textBinary := field("?column?", catalog.TEXTOID, -1, 1)
+	selectComplete := &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}
+	ready := &pgproto3.ReadyForQuery{TxStatus: byte(txstatus.TXIDLE)}
+
 	tt := []MessageGroup{
 		{
 			Request: []pgproto3.FrontendMessage{
@@ -5316,48 +5334,22 @@ func TestXProtoPureVirtual(t *testing.T) {
 				&pgproto3.ParseComplete{},
 				&pgproto3.ParseComplete{},
 				&pgproto3.ParameterDescription{ParameterOIDs: []uint32{}},
-				&pgproto3.RowDescription{
-					Fields: []pgproto3.FieldDescription{
-						{
-							Name:                 []byte("pg_is_in_recovery"),
-							TableOID:             0x0,
-							TableAttributeNumber: 0x0,
-							DataTypeOID:          catalog.BOOLOID,
-							DataTypeSize:         1,
-							TypeModifier:         -1,
-							Format:               0,
-						},
-					},
-				},
+				&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{boolText}},
 				&pgproto3.BindComplete{},
 				&pgproto3.DataRow{
 					Values: [][]byte{[]byte("f")},
 				},
 
-				&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")},
+				selectComplete,
 				&pgproto3.ParameterDescription{ParameterOIDs: []uint32{}},
-				&pgproto3.RowDescription{
-					Fields: []pgproto3.FieldDescription{
-						{
-							Name:                 []byte("?column?"),
-							TableOID:             0x0,
-							TableAttributeNumber: 0x0,
-							DataTypeOID:          catalog.INT4OID,
-							DataTypeSize:         4,
-							TypeModifier:         -1,
-							Format:               0,
-						},
-					},
-				},
+				&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{intText}},
 				&pgproto3.BindComplete{},
 				&pgproto3.DataRow{
 					Values: [][]byte{[]byte("1")},
 				},
 
-				&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")},
-				&pgproto3.ReadyForQuery{
-					TxStatus: byte(txstatus.TXIDLE),
-				},
+				selectComplete,
+				ready,
 			},
 		},
 
@@ -5372,21 +5364,152 @@ func TestXProtoPureVirtual(t *testing.T) {
 					PreparedStatement: "q2",
 					ResultFormatCodes: []int16{xproto.FormatCodeBinary},
 				},
+				&pgproto3.Describe{ObjectType: 'P'},
 				&pgproto3.Execute{},
 				&pgproto3.Sync{},
 			},
 			Response: []pgproto3.BackendMessage{
 				&pgproto3.ParseComplete{},
 				&pgproto3.BindComplete{},
+				&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{boolBinary}},
 				&pgproto3.DataRow{
 					Values: [][]byte{[]byte{0}},
 				},
-				&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")},
-				&pgproto3.ReadyForQuery{
-					TxStatus: byte(txstatus.TXIDLE),
-				},
+				selectComplete,
+				ready,
 			},
 		},
+	}
+
+	const issueQuery = "SELECT pg_is_in_recovery()::bool, current_setting('transaction_read_only')::bool;"
+	for _, tc := range []struct {
+		query   string
+		formats []int16
+		fields  []pgproto3.FieldDescription
+		values  [][]byte
+	}{
+		{
+			query: issueQuery, formats: []int16{1},
+			fields: []pgproto3.FieldDescription{boolBinary, field("current_setting", catalog.BOOLOID, 1, 1)},
+			values: [][]byte{{0}, {0}},
+		},
+		{
+			query: issueQuery, formats: []int16{0},
+			fields: []pgproto3.FieldDescription{boolText, field("current_setting", catalog.BOOLOID, 1, 0)},
+			values: [][]byte{[]byte("f"), []byte("f")},
+		},
+		{
+			query: "SELECT 1, -1", formats: []int16{1},
+			fields: []pgproto3.FieldDescription{intBinary, intBinary},
+			values: [][]byte{{0, 0, 0, 1}, {0xff, 0xff, 0xff, 0xff}},
+		},
+		{
+			query: "SELECT 2147483648", formats: []int16{1},
+			fields: []pgproto3.FieldDescription{field("?column?", catalog.INT8OID, 8, 1)},
+			values: [][]byte{{0, 0, 0, 0, 0x80, 0, 0, 0}},
+		},
+		{
+			query: "SELECT -2147483649", formats: []int16{1},
+			fields: []pgproto3.FieldDescription{field("?column?", catalog.INT8OID, 8, 1)},
+			values: [][]byte{{0xff, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff}},
+		},
+		{
+			query: "SELECT 2147483648", formats: []int16{0},
+			fields: []pgproto3.FieldDescription{field("?column?", catalog.INT8OID, 8, 0)},
+			values: [][]byte{[]byte("2147483648")},
+		},
+		{
+			query: "SELECT NOT pg_is_in_recovery() AS pg_is_in_recovery", formats: []int16{1},
+			fields: []pgproto3.FieldDescription{boolBinary},
+			values: [][]byte{{1}},
+		},
+		{
+			query: "SELECT 1, pg_is_in_recovery(), 'hello'", formats: []int16{1},
+			fields: []pgproto3.FieldDescription{intBinary, boolBinary, textBinary},
+			values: [][]byte{{0, 0, 0, 1}, {0}, []byte("hello")},
+		},
+		{
+			query: "SELECT 1, pg_is_in_recovery(), 'hello'", formats: []int16{1, 0, 1},
+			fields: []pgproto3.FieldDescription{intBinary, boolText, textBinary},
+			values: [][]byte{{0, 0, 0, 1}, []byte("f"), []byte("hello")},
+		},
+		{
+			query:  "SELECT 1, pg_is_in_recovery(), 'hello'",
+			fields: []pgproto3.FieldDescription{intText, boolText, textText},
+			values: [][]byte{[]byte("1"), []byte("f"), []byte("hello")},
+		},
+		{
+			// This function is forwarded, so PostgreSQL supplies its binary INT4.
+			query: "SELECT length('hello')", formats: []int16{1},
+			fields: []pgproto3.FieldDescription{field("length", catalog.INT4OID, 4, 1)},
+			values: [][]byte{{0, 0, 0, 5}},
+		},
+	} {
+		tt = append(tt, MessageGroup{
+			Request: []pgproto3.FrontendMessage{
+				&pgproto3.Parse{Query: tc.query},
+				&pgproto3.Bind{ResultFormatCodes: tc.formats},
+				&pgproto3.Describe{ObjectType: 'P'},
+				&pgproto3.Execute{},
+				&pgproto3.Sync{},
+			},
+			Response: []pgproto3.BackendMessage{
+				&pgproto3.ParseComplete{}, &pgproto3.BindComplete{},
+				&pgproto3.RowDescription{Fields: tc.fields},
+				&pgproto3.DataRow{Values: tc.values}, selectComplete, ready,
+			},
+		})
+	}
+
+	// Prepare once, then alternate formats on the unnamed portal. Close the
+	// named statement first because protoTestRunner repeats the entire sequence.
+	textFields := []pgproto3.FieldDescription{intText, textText}
+	tt = append(tt, MessageGroup{
+		Request: []pgproto3.FrontendMessage{
+			&pgproto3.Close{ObjectType: 'S', Name: "q3"},
+			&pgproto3.Parse{Name: "q3", Query: "SELECT 1, 'hello'"},
+			&pgproto3.Describe{ObjectType: 'S', Name: "q3"}, &pgproto3.Sync{},
+		},
+		Response: []pgproto3.BackendMessage{
+			&pgproto3.CloseComplete{}, &pgproto3.ParseComplete{},
+			&pgproto3.ParameterDescription{ParameterOIDs: []uint32{}},
+			&pgproto3.RowDescription{Fields: textFields}, ready,
+		},
+	})
+	for _, tc := range []struct {
+		formats []int16
+		fields  []pgproto3.FieldDescription
+		values  [][]byte
+	}{
+		{[]int16{0}, textFields, [][]byte{[]byte("1"), []byte("hello")}},
+		{[]int16{1}, []pgproto3.FieldDescription{intBinary, textBinary}, [][]byte{{0, 0, 0, 1}, []byte("hello")}},
+		{[]int16{1, 0}, []pgproto3.FieldDescription{intBinary, textText}, [][]byte{{0, 0, 0, 1}, []byte("hello")}},
+		{nil, textFields, [][]byte{[]byte("1"), []byte("hello")}},
+	} {
+		tt = append(tt, MessageGroup{
+			Request: []pgproto3.FrontendMessage{
+				&pgproto3.Bind{PreparedStatement: "q3", ResultFormatCodes: tc.formats},
+				&pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Sync{},
+			},
+			Response: []pgproto3.BackendMessage{
+				&pgproto3.BindComplete{}, &pgproto3.RowDescription{Fields: tc.fields},
+				&pgproto3.DataRow{Values: tc.values}, selectComplete, ready,
+			},
+		})
+		if len(tc.formats) == 1 && tc.formats[0] == xproto.FormatCodeBinary {
+			tt = append(tt, MessageGroup{
+				Request: []pgproto3.FrontendMessage{
+					&pgproto3.Describe{ObjectType: 'S', Name: "q3"}, &pgproto3.Sync{},
+					&pgproto3.Query{String: "SELECT 1"},
+				},
+				Response: []pgproto3.BackendMessage{
+					&pgproto3.ParameterDescription{ParameterOIDs: []uint32{}},
+					&pgproto3.RowDescription{Fields: textFields}, ready,
+					&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{intText}},
+					&pgproto3.DataRow{Values: [][]byte{[]byte("1")}}, selectComplete, ready,
+				},
+			})
+		}
 	}
 
 	protoTestRunner(t, frontend, tt)

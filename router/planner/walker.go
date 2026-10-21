@@ -3,10 +3,9 @@ package planner
 import (
 	"context"
 	"fmt"
+	"math"
 
-	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/pg-sharding/lyx/lyx"
-	"github.com/pg-sharding/spqr/pkg/catalog"
 	"github.com/pg-sharding/spqr/pkg/config"
 	"github.com/pg-sharding/spqr/pkg/plan"
 	"github.com/pg-sharding/spqr/pkg/tupleslot"
@@ -33,12 +32,29 @@ func formatBool(v bool, format int16) []byte {
 }
 
 func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr QueryPlanner, stmt *lyx.Select) (plan.Plan, error) {
-	virtualRowCols := []pgproto3.FieldDescription{}
-	virtualRowVals := [][]byte{}
+	return planTargetList(ctx, rm, plr, stmt, false)
+}
+
+// PlanVirtualTargetList rebuilds a purely local target list without planning backend work.
+// A nil plan means the SELECT requires another execution path.
+func PlanVirtualTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr QueryPlanner, stmt *lyx.Select) (*plan.VirtualPlan, error) {
+	if len(stmt.FromClause) != 0 || stmt.LArg != nil || stmt.RArg != nil || stmt.WithClause != nil {
+		return nil, nil
+	}
+	p, err := planTargetList(ctx, rm, plr, stmt, true)
+	if err != nil {
+		return nil, err
+	}
+	virtualPlan, _ := p.(*plan.VirtualPlan)
+	return virtualPlan, nil
+}
+
+func planTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr QueryPlanner, stmt *lyx.Select, virtualOnly bool) (plan.Plan, error) {
+	row := virtualResultBuilder{rm: rm}
 
 	var p plan.Plan
 
-	for ind, expr := range stmt.TargetList {
+	for _, expr := range stmt.TargetList {
 		actualExpr := expr
 		colname := "?column?"
 		if rt, ok := expr.(*lyx.ResTarget); ok {
@@ -49,18 +65,8 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 		switch e := actualExpr.(type) {
 		case *lyx.SVFOP_CURRENT_USER:
 			p = plan.Combine(p, &plan.VirtualPlan{})
-			virtualRowCols = append(virtualRowCols,
-				pgproto3.FieldDescription{
-					Name:                 []byte(colname),
-					DataTypeOID:          catalog.TEXTOID,
-					TypeModifier:         -1,
-					DataTypeSize:         -1,
-					TableAttributeNumber: 0,
-					TableOID:             0,
-					Format:               0,
-				})
-
-			virtualRowVals = append(virtualRowVals, []byte(rm.SPH.Usr()))
+			row.appendText(colname, -1, rm.SPH.Usr())
+			continue
 
 		case *lyx.AExprNot:
 			/* inspect our arg. If this is pg_is_in_recovery, apply NOT */
@@ -68,19 +74,9 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 			case *lyx.FuncApplication:
 				if arg.Name == "pg_is_in_recovery" {
 					p = plan.Combine(p, &plan.VirtualPlan{})
-					virtualRowCols = append(virtualRowCols,
-						pgproto3.FieldDescription{
-							Name:                 []byte("pg_is_in_recovery"),
-							DataTypeOID:          catalog.BOOLOID,
-							TypeModifier:         -1,
-							DataTypeSize:         1,
-							TableAttributeNumber: 0,
-							TableOID:             0,
-							Format:               0,
-						})
 
 					/* notice this sign */
-					virtualRowVals = append(virtualRowVals, formatBool(rm.SPH.GetTsa() == config.TargetSessionAttrsRW, rm.GetResultFormatCode(ind)))
+					row.appendBool("pg_is_in_recovery", rm.SPH.GetTsa() == config.TargetSessionAttrsRW)
 
 					continue
 				}
@@ -91,61 +87,15 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 			/* for queries, that need to access data on shard, ignore these "virtual" func.	 */
 			if e.Name == "pg_is_in_recovery" {
 				p = plan.Combine(p, &plan.VirtualPlan{})
-				virtualRowCols = append(virtualRowCols,
-					pgproto3.FieldDescription{
-						Name:                 []byte("pg_is_in_recovery"),
-						DataTypeOID:          catalog.BOOLOID,
-						TypeModifier:         -1,
-						DataTypeSize:         1,
-						TableAttributeNumber: 0,
-						TableOID:             0,
-						Format:               0,
-					})
-
-				virtualRowVals = append(virtualRowVals, formatBool(rm.SPH.GetTsa() != config.TargetSessionAttrsRW, rm.GetResultFormatCode(ind)))
+				row.appendBool("pg_is_in_recovery", rm.SPH.GetTsa() != config.TargetSessionAttrsRW)
 
 				continue
 			} else if e.Name == virtual.VirtualFuncIsReady {
 				p = plan.Combine(p, &plan.VirtualPlan{})
-				virtualRowCols = append(virtualRowCols,
-					pgproto3.FieldDescription{
-						Name:                 []byte(virtual.VirtualFuncIsReady),
-						DataTypeOID:          catalog.BOOLOID,
-						TypeModifier:         -1,
-						DataTypeSize:         1,
-						TableAttributeNumber: 0,
-						TableOID:             0,
-						Format:               0,
-					})
-
-				if plr.Ready() {
-					virtualRowVals = append(virtualRowVals, []byte{byte('t')})
-				} else {
-					virtualRowVals = append(virtualRowVals, []byte{byte('f')})
-				}
+				row.appendBool(virtual.VirtualFuncIsReady, plr.Ready())
 				continue
 			} else if e.Name == virtual.VirtualFuncHosts {
 				p = plan.Combine(p, &plan.VirtualPlan{})
-				virtualRowCols = append(virtualRowCols,
-					pgproto3.FieldDescription{
-						Name:                 []byte("host"),
-						DataTypeOID:          catalog.TEXTOID,
-						TypeModifier:         -1,
-						DataTypeSize:         1,
-						TableAttributeNumber: 0,
-						TableOID:             0,
-						Format:               0,
-					},
-					pgproto3.FieldDescription{
-						Name:                 []byte("rw"),
-						DataTypeOID:          catalog.TEXTOID,
-						TypeModifier:         -1,
-						DataTypeSize:         1,
-						TableAttributeNumber: 0,
-						TableOID:             0,
-						Format:               0,
-					},
-				)
 				if len(e.Args) == 1 {
 					var k string
 
@@ -157,8 +107,8 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 					}
 
 					if v, ok := rm.CSM.InstanceHealthChecks()[k]; ok {
-						virtualRowVals = append(virtualRowVals,
-							[]byte(k), fmt.Appendf(nil, "%v", v.CR.RW))
+						row.appendText("host", 1, k)
+						row.appendText("rw", 1, fmt.Sprintf("%v", v.CR.RW))
 					} else {
 						return nil, fmt.Errorf("incorrect first argument for %s", virtual.VirtualFuncHosts)
 					}
@@ -170,23 +120,35 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 			} else if e.Name == "current_setting" && len(e.Args) == 1 {
 				if val, ok := e.Args[0].(*lyx.AExprSConst); ok && val.Value == "transaction_read_only" {
 					p = plan.Combine(p, &plan.VirtualPlan{})
-					virtualRowCols = append(virtualRowCols,
-						pgproto3.FieldDescription{
-							Name:                 []byte("current_setting"),
-							DataTypeOID:          catalog.BOOLOID,
-							TypeModifier:         -1,
-							DataTypeSize:         1,
-							TableAttributeNumber: 0,
-							TableOID:             0,
-							Format:               0,
-						})
-
-					virtualRowVals = append(virtualRowVals, formatBool(rm.SPH.GetTsa() != config.TargetSessionAttrsRW, rm.GetResultFormatCode(ind)))
+					row.appendBool("current_setting", rm.SPH.GetTsa() != config.TargetSessionAttrsRW)
 
 					continue
 				}
 			}
 
+		/* Expression like SELECT 1, SELECT 'a', SELECT 1.0, SELECT true, SELECT false */
+		case *lyx.AExprSConst:
+
+			p = plan.Combine(p, &plan.VirtualPlan{})
+			row.appendText(colname, -1, e.Value)
+			continue
+
+		case *lyx.AExprIConst:
+			if e.Value < math.MinInt32 || e.Value > math.MaxInt32 {
+				break
+			}
+
+			p = plan.Combine(p, &plan.VirtualPlan{})
+			row.appendInt4(colname, int32(e.Value))
+			continue
+		}
+
+		if virtualOnly {
+			return nil, nil
+		}
+
+		switch e := actualExpr.(type) {
+		case *lyx.FuncApplication:
 			if e.Name == "current_schema" || e.Name == "now" || e.Name == "set_config" || e.Name == "version" || e.Name == "current_setting" {
 				p = plan.Combine(p, &plan.RandomDispatchPlan{})
 				continue
@@ -214,39 +176,7 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 				/* very questionable. */
 				p = plan.Combine(p, &plan.RandomDispatchPlan{})
 			}
-		/* Expression like SELECT 1, SELECT 'a', SELECT 1.0, SELECT true, SELECT false */
-		case *lyx.AExprSConst:
-
-			p = plan.Combine(p, &plan.VirtualPlan{})
-			virtualRowCols = append(virtualRowCols,
-				pgproto3.FieldDescription{
-					Name:                 []byte(colname),
-					DataTypeOID:          catalog.TEXTOID,
-					TypeModifier:         -1,
-					DataTypeSize:         -1,
-					TableAttributeNumber: 0,
-					TableOID:             0,
-					Format:               0,
-				})
-
-			virtualRowVals = append(virtualRowVals, []byte(e.Value))
-
-		case *lyx.AExprIConst:
-
-			p = plan.Combine(p, &plan.VirtualPlan{})
-			virtualRowCols = append(virtualRowCols,
-				pgproto3.FieldDescription{
-					Name:                 []byte(colname),
-					DataTypeOID:          catalog.INT4OID,
-					TypeModifier:         -1,
-					DataTypeSize:         4,
-					TableAttributeNumber: 0,
-					TableOID:             0,
-					Format:               0,
-				})
-
-			virtualRowVals = append(virtualRowVals, fmt.Appendf(nil, "%d", e.Value))
-		case *lyx.AExprNConst, *lyx.AExprBConst:
+		case *lyx.AExprIConst, *lyx.AExprNConst, *lyx.AExprBConst:
 			p = plan.Combine(p, &plan.RandomDispatchPlan{})
 
 		/* Special case for SELECT current_schema */
@@ -272,8 +202,8 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 	switch q := p.(type) {
 	case *plan.VirtualPlan:
 		q.TTS = &tupleslot.TupleTableSlot{
-			Desc: virtualRowCols,
-			Raw:  [][][]byte{virtualRowVals},
+			Desc: row.fields,
+			Raw:  [][][]byte{row.values},
 		}
 	}
 

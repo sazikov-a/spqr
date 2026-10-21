@@ -1269,6 +1269,22 @@ func (rst *RelayStateImpl) PrepareExecutionSlice(ctx context.Context, rm *rmeta.
 	// txactive == 0 || activeSh == nil
 	if !rst.poolMgr.ValidateGangChange(rst.QueryExecutor()) {
 		if !rst.Client().EnhancedMultiShardProcessing() {
+			// Bound virtual rows contain format-dependent bytes. Refresh only
+			// target-list results; other virtual producers retain their reuse policy.
+			if previous, ok := prevPlan.(*plan.VirtualPlan); ok && previous.SubPlan == nil && rm != nil {
+				stmt, isSelect := rm.Stmt.(*lyx.Select)
+				queryPlanner, canPlan := rst.Qr.(planner.QueryPlanner)
+				if isSelect && canPlan {
+					fresh, err := planner.PlanVirtualTargetList(ctx, rm, queryPlanner, stmt)
+					if err != nil {
+						return nil, err
+					}
+					if fresh != nil {
+						fresh.SetStmt(stmt)
+						return fresh, nil
+					}
+				}
+			}
 
 			/* TODO: fix this */
 			prevPlan.SetStmt(rst.qp.Stmt())
