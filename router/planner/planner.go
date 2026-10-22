@@ -782,16 +782,12 @@ func ConsoleFunctionCall(
 					DataTypeSize:         1,
 					TableAttributeNumber: 0,
 					TableOID:             0,
-					Format:               0,
+					Format:               rm.GetResultFormatCode(0),
 				},
 			},
 		}
 
-		if plr.Ready() {
-			tts.Raw = [][][]byte{[][]byte{[]byte{'t'}}}
-		} else {
-			tts.Raw = [][][]byte{[][]byte{[]byte{'f'}}}
-		}
+		tts.Raw = [][][]byte{{formatBool(plr.Ready(), rm.GetResultFormatCode(0))}}
 
 		return tts, nil
 	case virtual.VirtualRouteKey:

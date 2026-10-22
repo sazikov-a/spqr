@@ -1043,7 +1043,7 @@ func (s *QueryStateExecutorImpl) executeSlicePrepare(qd *QueryDesc, p plan.Plan,
 
 }
 
-func (s *QueryStateExecutorImpl) executeInnerSlice(serv server.Server, p plan.Plan) error {
+func (s *QueryStateExecutorImpl) executeInnerSlice(serv server.Server, p plan.Plan, outerQuery *QueryDesc) error {
 
 	/* The main difference between top-level and inner slices are that
 	* inner slice results are not transferred to client.
@@ -1053,7 +1053,7 @@ func (s *QueryStateExecutorImpl) executeInnerSlice(serv server.Server, p plan.Pl
 		/* XXX: Do all required job in sub-plan */
 		spqrlog.Zero.Debug().Uint("client", s.cl.ID()).Msg("executing sub plan")
 
-		if err := s.executeInnerSlice(serv, sp); err != nil {
+		if err := s.executeInnerSlice(serv, sp, nil); err != nil {
 			return err
 		}
 	}
@@ -1066,6 +1066,20 @@ func (s *QueryStateExecutorImpl) executeInnerSlice(serv server.Server, p plan.Pl
 	/*  Inner slice should always contain per-shard overwrite message. */
 	qd := &QueryDesc{
 		simple: true,
+	}
+	if outerQuery != nil {
+		if bind, ok := outerQuery.Msg.(*pgproto3.Bind); ok {
+			// Output-producing subqueries keep the client's parameter and result
+			// formats. PostgreSQL encodes their rows before local postprocessing.
+			innerBind := *bind
+			innerBind.DestinationPortal = ""
+			qd = &QueryDesc{
+				Msg:            &innerBind,
+				exec:           pgexec,
+				parameterOIDs:  outerQuery.parameterOIDs,
+				describePortal: true,
+			}
+		}
 	}
 
 	if err := p.PrepareRunSlice(serv); err != nil {
@@ -1089,6 +1103,11 @@ func (s *QueryStateExecutorImpl) executeInnerSlice(serv server.Server, p plan.Pl
 
 func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Plan, replyCl bool) error {
 	serv := s.Client().Server()
+	bind, extended := qd.Msg.(*pgproto3.Bind)
+	var resultFormats []int16
+	if extended {
+		resultFormats = bind.ResultFormatCodes
+	}
 
 	if serv != nil {
 		spqrlog.Zero.Debug().
@@ -1113,7 +1132,11 @@ func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Pl
 		if sp := topPlan.Subplan(); sp != nil {
 			/* XXX: Do all required job in sub-plan */
 			spqrlog.Zero.Debug().Uint("client", s.cl.ID()).Msg("executing sub plan")
-			if err := s.executeInnerSlice(serv, sp); err != nil {
+			var outputQuery *QueryDesc
+			if _, ok := topPlan.(*plan.VirtualPlan); ok {
+				outputQuery = qd
+			}
+			if err := s.executeInnerSlice(serv, sp, outputQuery); err != nil {
 				return err
 			}
 		}
@@ -1124,12 +1147,16 @@ func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Pl
 	case *plan.VirtualPlan:
 		/* execute logic without shard dispatch */
 
-		if q.TTS != nil && len(q.TTS.Raw) != 0 {
+		if q.TTS != nil {
+			fields, err := q.TTS.Desc.WithResultFormats(resultFormats)
+			if err != nil {
+				return err
+			}
 			/* only send row description for simple proto case */
 			if s.es.expectRowDesc {
 				if replyCl {
 					if err := s.Client().Send(&pgproto3.RowDescription{
-						Fields: q.TTS.Desc,
+						Fields: fields,
 					}); err != nil {
 						return err
 					}
@@ -1278,7 +1305,11 @@ func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Pl
 		// skip
 		case *pgproto3.BindComplete:
 		// never expect these msgs
-		case *pgproto3.ParseComplete, *pgproto3.CloseComplete:
+		case *pgproto3.ParseComplete:
+			if !qd.parseSent {
+				return rerrors.ErrExecutorSyncLost.Detail("Unexpected ParseComplete without an internal Parse")
+			}
+		case *pgproto3.CloseComplete:
 			return rerrors.ErrExecutorSyncLost.Detail("Unexpected prepared statement response in plan deploy")
 		case *pgproto3.CommandComplete:
 			/*
@@ -1296,7 +1327,7 @@ func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Pl
 			}
 		case *pgproto3.RowDescription:
 			if s.es.expectRowDesc {
-				if replyCl && overwriteCC == nil {
+				if replyCl && overwriteCC == nil && !extended {
 					err = s.Client().Send(msg)
 					if err != nil {
 						return err

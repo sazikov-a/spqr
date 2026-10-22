@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"encoding/binary"
+	"fmt"
 	"strconv"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pg-sharding/lyx/lyx"
 	"github.com/pg-sharding/spqr/pkg/catalog"
 	"github.com/pg-sharding/spqr/pkg/models/spqrerror"
@@ -16,39 +19,64 @@ const (
 )
 
 type AggregateState interface {
-	Init(oid int)
+	Init(oid int, format int16)
 
-	Aggregate(v []byte)
+	Aggregate(v []byte) error
 
-	Finalize() any
+	Finalize(format int16) []byte
 }
 
 type CountAggregate struct {
-	v   int64
-	oid int
+	v      int64
+	oid    int
+	format int16
 }
 
 // Aggregate implements [AggregateState].
-func (c *CountAggregate) Aggregate(v []byte) {
-	switch c.oid {
-	case catalog.INT4OID:
-		n, _ := strconv.ParseInt(string(v), 10, 64)
-		c.v += n
-	case catalog.INT8OID:
-		n, _ := strconv.ParseInt(string(v), 10, 64)
-		c.v += n
+func (c *CountAggregate) Aggregate(v []byte) error {
+	var n int64
+	switch c.format {
+	case pgtype.TextFormatCode:
+		var err error
+		n, err = strconv.ParseInt(string(v), 10, 64)
+		if err != nil {
+			return err
+		}
+	case pgtype.BinaryFormatCode:
+		switch c.oid {
+		case catalog.INT4OID:
+			if len(v) != 4 {
+				return fmt.Errorf("invalid binary int4 aggregate value length: %d", len(v))
+			}
+			n = int64(int32(binary.BigEndian.Uint32(v)))
+		case catalog.INT8OID:
+			if len(v) != 8 {
+				return fmt.Errorf("invalid binary int8 aggregate value length: %d", len(v))
+			}
+			n = int64(binary.BigEndian.Uint64(v))
+		default:
+			return fmt.Errorf("unsupported binary count aggregate input type: %d", c.oid)
+		}
+	default:
+		return fmt.Errorf("unsupported count aggregate input format: %d", c.format)
 	}
+	c.v += n
+	return nil
 }
 
 // Finalize implements [AggregateState].
-func (c *CountAggregate) Finalize() any {
-	return c.v
+func (c *CountAggregate) Finalize(format int16) []byte {
+	if format == pgtype.BinaryFormatCode {
+		return binary.BigEndian.AppendUint64(nil, uint64(c.v))
+	}
+	return strconv.AppendInt(nil, c.v, 10)
 }
 
 // Init implements [AggregateState].
-func (c *CountAggregate) Init(oid int) {
+func (c *CountAggregate) Init(oid int, format int16) {
 	c.v = 0
 	c.oid = oid
+	c.format = format
 }
 
 var _ AggregateState = &CountAggregate{}

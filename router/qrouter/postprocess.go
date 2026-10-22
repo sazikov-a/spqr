@@ -400,14 +400,16 @@ func (qr *ProxyQrouter) addAggregateToPlan(
 							retSlice.TTS.Desc = xproto.CopyFieldDescriptions(v.Fields)
 
 							for i, agg := range aggStates {
-								agg.Init(int(v.Fields[i].DataTypeOID))
+								agg.Init(int(v.Fields[i].DataTypeOID), v.Fields[i].Format)
 							}
 						}
 					case *pgproto3.ErrorResponse:
 						errmsg = v
 					case *pgproto3.DataRow:
 						for i, agg := range aggStates {
-							agg.Aggregate(v.Values[i])
+							if err := agg.Aggregate(v.Values[i]); err != nil {
+								return err
+							}
 						}
 					default:
 						/* All ok? */
@@ -415,12 +417,14 @@ func (qr *ProxyQrouter) addAggregateToPlan(
 				}
 			}
 
-			datRow := []string{}
-			for _, agg := range aggStates {
-				datRow = append(datRow, fmt.Sprintf("%+v", agg.Finalize()))
+			datRow := make([][]byte, len(aggStates))
+			for i, agg := range aggStates {
+				format := rm.GetResultFormatCode(i)
+				retSlice.TTS.Desc[i].Format = format
+				datRow[i] = agg.Finalize(format)
 			}
 
-			retSlice.TTS.WriteDataRow(datRow...)
+			retSlice.TTS.Raw = append(retSlice.TTS.Raw, datRow)
 
 			return nil
 		}

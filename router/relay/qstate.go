@@ -28,45 +28,43 @@ func AdvancedPoolModeNeeded(rst RelayStateMgr) bool {
 	return rst.Client().Rule().PoolMode == config.PoolModeTransaction && rst.Client().Rule().PoolPreparedStatement || config.RouterMode(config.RouterConfig().RouterMode) == config.ProxyMode
 }
 
-func ReplyVirtualParamState(cl client.Client, name string, val []byte) {
-	/* TODO: handle errors */
-	_ = cl.Send(
-		&pgproto3.RowDescription{
-			Fields: []pgproto3.FieldDescription{
-				{
-					Name:         []byte(name),
-					DataTypeOID:  25,
-					DataTypeSize: -1,
-					TypeModifier: -1,
-				},
+func ReplyVirtualParamState(cl client.Client, name string, val []byte, formats ...int16) error {
+	return ReplyVirtualParamStateTTS(cl, &tupleslot.TupleTableSlot{
+		Desc: tupleslot.TupleDesc{
+			{
+				Name:         []byte(name),
+				DataTypeOID:  catalog.TEXTOID,
+				DataTypeSize: -1,
+				TypeModifier: -1,
 			},
 		},
-	)
-
-	_ = cl.Send(
-		&pgproto3.DataRow{
-			Values: [][]byte{
-				[]byte(val),
-			},
-		},
-	)
+		Raw: [][][]byte{{val}},
+	}, formats...)
 }
 
-func ReplyVirtualParamStateTTS(cl client.Client, tts *tupleslot.TupleTableSlot) {
-	/* TODO: handle errors */
-	_ = cl.Send(
+func ReplyVirtualParamStateTTS(cl client.Client, tts *tupleslot.TupleTableSlot, formats ...int16) error {
+	fields, err := tts.Desc.WithResultFormats(formats)
+	if err != nil {
+		return err
+	}
+	if err := cl.Send(
 		&pgproto3.RowDescription{
-			Fields: tts.Desc,
+			Fields: fields,
 		},
-	)
+	); err != nil {
+		return err
+	}
 
 	for _, r := range tts.Raw {
-		_ = cl.Send(
+		if err := cl.Send(
 			&pgproto3.DataRow{
 				Values: r,
 			},
-		)
+		); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 var errAbortedTx = fmt.Errorf("current transaction is aborted, commands ignored until end of transaction block")
@@ -341,7 +339,9 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 
 			tts.WriteDataRow(val)
 
-			ReplyVirtualParamStateTTS(rst.Client(), &tts)
+			if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+				return nil, err
+			}
 
 		} else if session.ParamIsString(param) {
 
@@ -368,7 +368,9 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 
 			tts.WriteDataRow(val)
 
-			ReplyVirtualParamStateTTS(rst.Client(), &tts)
+			if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+				return nil, err
+			}
 
 		} else {
 			switch param {
@@ -395,7 +397,9 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 					tts.WriteDataRow("off")
 				}
 
-				ReplyVirtualParamStateTTS(rst.Client(), &tts)
+				if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+					return nil, err
+				}
 
 			case session.SPQR_COMMIT_STRATEGY:
 
@@ -411,11 +415,15 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 				}
 				tts.WriteDataRow(string(rst.Client().CommitStrategy()))
 
-				ReplyVirtualParamStateTTS(rst.Client(), &tts)
+				if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+					return nil, err
+				}
 			default:
 
 				if strings.HasPrefix(param, "__spqr__") {
-					ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]))
+					if err := ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]), rst.localResultFormats...); err != nil {
+						return nil, err
+					}
 				} else {
 					/* If router does dot have any info about param, fire query to random shard. */
 					if _, ok := rst.Client().Params()[param]; !ok {
@@ -423,7 +431,9 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 						return pd, err
 					}
 
-					ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]))
+					if err := ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]), rst.localResultFormats...); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}

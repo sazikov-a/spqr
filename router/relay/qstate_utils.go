@@ -94,9 +94,35 @@ func DispatchSlice(qd *QueryDesc,
 				}
 			}
 		} else {
-			/* this message is actually bind */
-			if err := serv.SendShard(qd.Msg, targ); err != nil {
+			bind := qd.Msg.(*pgproto3.Bind)
+			if p != nil {
+				if query := p.GetGangMemberMsg(targ); query != "" {
+					// A rewritten query still needs the client's Bind formats.
+					// Use an unnamed statement so the original cached statement
+					// remains available on this connection.
+					if err := serv.SendShard(&pgproto3.Parse{
+						Query:         query,
+						ParameterOIDs: qd.parameterOIDs,
+					}, targ); err != nil {
+						return err
+					}
+					qd.parseSent = true
+					bnd := *bind
+					bnd.PreparedStatement = ""
+					bind = &bnd
+				}
+			}
+			if err := serv.SendShard(bind, targ); err != nil {
 				return err
+			}
+
+			if qd.describePortal {
+				if err := serv.SendShard(&pgproto3.Describe{
+					ObjectType: 'P',
+					Name:       bind.DestinationPortal,
+				}, targ); err != nil {
+					return err
+				}
 			}
 
 			if err := serv.SendShard(qd.exec, targ); err != nil {

@@ -19,6 +19,10 @@ type QueryDesc struct {
 	simple    bool
 	ParamsNum int
 	exec      *pgproto3.Execute
+
+	parameterOIDs  []uint32
+	describePortal bool
+	parseSent      bool
 }
 
 type ExecutorState struct {

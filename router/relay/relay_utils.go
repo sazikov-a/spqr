@@ -11,14 +11,14 @@ import (
 	"github.com/pg-sharding/spqr/router/xproto"
 )
 
-func BindAndReadSliceResult(rst *RelayStateImpl, forceSimple bool, bind *pgproto3.Bind, portal string, maxrows uint32) error {
+func BindAndReadSliceResult(rst *RelayStateImpl, bind *pgproto3.Bind, parameterOIDs []uint32, portal string, maxrows uint32) error {
 
 	/* Case when no describe stmt was issued before Execute+Sync*/
 
 	qd := &QueryDesc{
-		Msg:       bind,
-		ParamsNum: len(bind.Parameters),
-		simple:    forceSimple,
+		Msg:           bind,
+		ParamsNum:     len(bind.Parameters),
+		parameterOIDs: parameterOIDs,
 	}
 
 	if portal == "" {
@@ -37,7 +37,11 @@ func BindAndReadSliceResult(rst *RelayStateImpl, forceSimple bool, bind *pgproto
 		}
 	}
 
-	return rst.QueryExecutor().ExecuteSlice(qd, rst.bindQueryPlan /*  ugh... fix this someday */, true)
+	p := rst.bindQueryPlan
+	if portal != "" {
+		p = rst.bindQueryPlanMP[portal]
+	}
+	return rst.QueryExecutor().ExecuteSlice(qd, p, true)
 }
 
 func gangMemberDeployPreparedStatement(shard shard.ShardHostInstance, hash uint64, d *prepstatement.PreparedStatementDefinition) (*prepstatement.PreparedStatementDescriptor, pgproto3.BackendMessage, error) {

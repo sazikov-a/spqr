@@ -13,6 +13,7 @@ import (
 	"github.com/pg-sharding/spqr/pkg/plan"
 	"github.com/pg-sharding/spqr/pkg/prepstatement"
 	"github.com/pg-sharding/spqr/pkg/shard"
+	"github.com/pg-sharding/spqr/pkg/tupleslot"
 	"github.com/pg-sharding/spqr/qdb"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -113,6 +114,9 @@ type RelayStateImpl struct {
 	saveBind        pgproto3.Bind
 	saveBindNamed   map[string]*pgproto3.Bind
 	savedPortalDesc map[string]*PortalDesc
+
+	// Formats for local replies emitted synchronously while processing Bind.
+	localResultFormats []int16
 
 	WaitSync bool
 
@@ -746,6 +750,19 @@ func (rst *RelayStateImpl) DescribePrepared(objType byte, name string, dMsg *pgp
 		if !rst.unnamedPortalExists && name == "" {
 			return spqrerror.New(spqrerror.PG_PORTAL_DOES_NOT_EXISTS, "portal \"\" does not exist")
 		}
+		bindName := rst.lastBindName
+		bnd := &rst.saveBind
+		p := rst.bindQueryPlan
+		if name != "" {
+			if _, ok := rst.executeMp[name]; !ok {
+				return spqrerror.New(
+					spqrerror.PG_PORTAL_DOES_NOT_EXISTS,
+					fmt.Sprintf("portal \"%s\" does not exist", name))
+			}
+			bindName = rst.lastBindNameMP[name]
+			bnd = rst.saveBindNamed[name]
+			p = rst.bindQueryPlanMP[name]
+		}
 
 		spqrlog.Zero.Debug().
 			Uint("client", rst.Client().ID()).
@@ -753,20 +770,9 @@ func (rst *RelayStateImpl) DescribePrepared(objType byte, name string, dMsg *pgp
 			Str("name", name).
 			Msg("Describe portal")
 
-		portDesc, ok := rst.savedPortalDesc[rst.lastBindName]
+		portDesc, ok := rst.savedPortalDesc[bindName]
 
 		if !ok {
-
-			p := rst.bindQueryPlan
-			if name != "" {
-				if _, ok := rst.executeMp[name]; !ok {
-					return spqrerror.New(
-						spqrerror.PG_PORTAL_DOES_NOT_EXISTS,
-						fmt.Sprintf("portal \"%s\" does not exist", name))
-				}
-				p = rst.bindQueryPlanMP[name]
-			}
-
 			switch q := p.(type) {
 			case *plan.VirtualPlan:
 				// skip deploy
@@ -793,8 +799,14 @@ func (rst *RelayStateImpl) DescribePrepared(objType byte, name string, dMsg *pgp
 		}
 
 		if portDesc.rd != nil {
+			// The cached fields belong to the statement, but result formats belong
+			// to each Bind. Keep cached metadata independent of any portal's formats.
+			fields, err := tupleslot.TupleDesc(portDesc.rd.Fields).WithResultFormats(bnd.ResultFormatCodes)
+			if err != nil {
+				return err
+			}
 			// send to the client
-			if err := rst.Client().Send(portDesc.rd); err != nil {
+			if err := rst.Client().Send(&pgproto3.RowDescription{Fields: fields}); err != nil {
 				return err
 			}
 		}
@@ -940,18 +952,23 @@ func (rst *RelayStateImpl) BindPrepared(
 		rst.executeMp[destinationPortal] = emptyExecFunc
 	}
 
+	// Some local statements return their description without invoking the binder.
+	// Save their result formats too, so Describe always uses this portal's Bind.
+	var bnd *pgproto3.Bind
+	if destinationPortal == "" {
+		bnd = &rst.saveBind
+	} else {
+		rst.saveBindNamed[destinationPortal] = &pgproto3.Bind{}
+		bnd = rst.saveBindNamed[destinationPortal]
+	}
+	bnd.DestinationPortal = destinationPortal
+	bnd.ResultFormatCodes = resultFormatCodes
+
+	previousLocalResultFormats := rst.localResultFormats
+	rst.localResultFormats = resultFormatCodes
+	defer func() { rst.localResultFormats = previousLocalResultFormats }()
+
 	pd, err := rst.ProcQueryAdvancedTx(def.Query, func() error {
-		var bnd *pgproto3.Bind
-
-		if destinationPortal == "" {
-			bnd = &rst.saveBind
-		} else {
-			rst.saveBindNamed[destinationPortal] = &pgproto3.Bind{}
-			bnd = rst.saveBindNamed[destinationPortal]
-		}
-
-		bnd.DestinationPortal = destinationPortal
-
 		rm := rst.savedRM[preparedStatement]
 
 		rm.LastResultFormatCodes = resultFormatCodes
@@ -962,7 +979,6 @@ func (rst *RelayStateImpl) BindPrepared(
 		bnd.ParameterFormatCodes = parameterFormatCodes
 		rst.Client().SetBindParams(parameters)
 		rst.Client().SetParamFormatCodes(parameterFormatCodes)
-		bnd.ResultFormatCodes = resultFormatCodes
 		bnd.Parameters = parameters
 
 		ctx := context.TODO()
@@ -987,16 +1003,10 @@ func (rst *RelayStateImpl) BindPrepared(
 		}
 
 		f := func(maxrows uint32) error {
+			parameterOIDs := def.ParameterOIDs
 			p := rst.bindQueryPlan
 			if destinationPortal != "" {
 				p = rst.bindQueryPlanMP[destinationPortal]
-			}
-			forceSimple := false
-
-			switch q := p.(type) {
-			case *plan.ScatterPlan:
-				forceSimple = len(q.OverwriteQuery) != 0 && len(bnd.Parameters) == 0
-			default:
 			}
 			switch p.(type) {
 			case *plan.VirtualPlan:
@@ -1010,7 +1020,7 @@ func (rst *RelayStateImpl) BindPrepared(
 				hash := rst.Client().PreparedStatementQueryHashByName(preparedStatement)
 				name := fmt.Sprintf("%d", hash)
 
-				_, _, err = rst.gangDeployPrepStmt(hash, &prepstatement.PreparedStatementDefinition{
+				rd, _, err := rst.gangDeployPrepStmt(hash, &prepstatement.PreparedStatementDefinition{
 					Name:          name,
 					Query:         def.Query,
 					ParameterOIDs: def.ParameterOIDs,
@@ -1019,9 +1029,12 @@ func (rst *RelayStateImpl) BindPrepared(
 				if err != nil {
 					return err
 				}
+				if rd != nil && rd.ParamDesc != nil {
+					parameterOIDs = rd.ParamDesc.ParameterOIDs
+				}
 			}
 
-			return BindAndReadSliceResult(rst, forceSimple, bnd, destinationPortal, maxrows)
+			return BindAndReadSliceResult(rst, bnd, parameterOIDs, destinationPortal, maxrows)
 		}
 
 		/* only populate map for non-empty portal */
