@@ -1176,6 +1176,10 @@ func (qr *ProxyQrouter) planSPQRCTID(
 		}
 
 		tts := &tupleslot.TupleTableSlot{}
+		projection := &plan.SubplanProjection{
+			ConsumeParameters: true,
+			PrefixFields:      tupleslot.TupleDesc{engine.TextOidFD(virtual.VirtualCTID)},
+		}
 
 		scanPlan.RunF = func(serv server.Server) error {
 			for _, sh := range serv.Datashards() {
@@ -1196,9 +1200,7 @@ func (qr *ProxyQrouter) planSPQRCTID(
 						break shLoop
 					case *pgproto3.RowDescription:
 						if tts.Desc == nil {
-							tts.Desc = []pgproto3.FieldDescription{
-								engine.TextOidFD(virtual.VirtualCTID),
-							}
+							tts.Desc = xproto.CopyFieldDescriptions(projection.PrefixFields)
 
 							for _, fd := range v.Fields {
 								tts.Desc = append(tts.Desc, pgproto3.FieldDescription{
@@ -1231,8 +1233,9 @@ func (qr *ProxyQrouter) planSPQRCTID(
 		}
 
 		return &plan.VirtualPlan{
-			TTS:     tts,
-			SubPlan: scanPlan,
+			TTS:               tts,
+			SubPlan:           scanPlan,
+			SubplanProjection: projection,
 		}, nil
 	default:
 		return nil, rerrors.ErrComplexQuery

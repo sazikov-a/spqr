@@ -2,7 +2,6 @@ package planner
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"math"
 
@@ -14,26 +13,16 @@ import (
 	"github.com/pg-sharding/spqr/pkg/tupleslot"
 	"github.com/pg-sharding/spqr/router/rmeta"
 	"github.com/pg-sharding/spqr/router/virtual"
-	"github.com/pg-sharding/spqr/router/xproto"
 )
 
-func formatBool(v bool, format int16) []byte {
-	switch format {
-	case xproto.FormatCodeBinary:
-		if v {
-			return []byte{1}
-		} else {
-			return []byte{0}
-		}
-	default:
-		if v {
-			return []byte{'t'}
-		} else {
-			return []byte{'f'}
-		}
+func formatTextBool(v bool) []byte {
+	if v {
+		return []byte{'t'}
 	}
+	return []byte{'f'}
 }
 
+// PlanTargetList produces local values in text format; the executor applies portal result formats.
 func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr QueryPlanner, stmt *lyx.Select) (plan.Plan, error) {
 	virtualRowCols := []pgproto3.FieldDescription{}
 	virtualRowVals := [][]byte{}
@@ -41,7 +30,6 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 	var p plan.Plan
 
 	for _, expr := range stmt.TargetList {
-		resultColumn := len(virtualRowCols)
 		actualExpr := expr
 		colname := "?column?"
 		if rt, ok := expr.(*lyx.ResTarget); ok {
@@ -60,7 +48,7 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 					DataTypeSize:         -1,
 					TableAttributeNumber: 0,
 					TableOID:             0,
-					Format:               rm.GetResultFormatCode(resultColumn),
+					Format:               0,
 				})
 
 			virtualRowVals = append(virtualRowVals, []byte(rm.SPH.Usr()))
@@ -79,11 +67,11 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 							DataTypeSize:         1,
 							TableAttributeNumber: 0,
 							TableOID:             0,
-							Format:               rm.GetResultFormatCode(resultColumn),
+							Format:               0,
 						})
 
 					/* notice this sign */
-					virtualRowVals = append(virtualRowVals, formatBool(rm.SPH.GetTsa() == config.TargetSessionAttrsRW, rm.GetResultFormatCode(resultColumn)))
+					virtualRowVals = append(virtualRowVals, formatTextBool(rm.SPH.GetTsa() == config.TargetSessionAttrsRW))
 
 					continue
 				}
@@ -102,10 +90,10 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 						DataTypeSize:         1,
 						TableAttributeNumber: 0,
 						TableOID:             0,
-						Format:               rm.GetResultFormatCode(resultColumn),
+						Format:               0,
 					})
 
-				virtualRowVals = append(virtualRowVals, formatBool(rm.SPH.GetTsa() != config.TargetSessionAttrsRW, rm.GetResultFormatCode(resultColumn)))
+				virtualRowVals = append(virtualRowVals, formatTextBool(rm.SPH.GetTsa() != config.TargetSessionAttrsRW))
 
 				continue
 			} else if e.Name == virtual.VirtualFuncIsReady {
@@ -118,10 +106,10 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 						DataTypeSize:         1,
 						TableAttributeNumber: 0,
 						TableOID:             0,
-						Format:               rm.GetResultFormatCode(resultColumn),
+						Format:               0,
 					})
 
-				virtualRowVals = append(virtualRowVals, formatBool(plr.Ready(), rm.GetResultFormatCode(resultColumn)))
+				virtualRowVals = append(virtualRowVals, formatTextBool(plr.Ready()))
 				continue
 			} else if e.Name == virtual.VirtualFuncHosts {
 				p = plan.Combine(p, &plan.VirtualPlan{})
@@ -133,7 +121,7 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 						DataTypeSize:         1,
 						TableAttributeNumber: 0,
 						TableOID:             0,
-						Format:               rm.GetResultFormatCode(resultColumn),
+						Format:               0,
 					},
 					pgproto3.FieldDescription{
 						Name:                 []byte("rw"),
@@ -142,7 +130,7 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 						DataTypeSize:         1,
 						TableAttributeNumber: 0,
 						TableOID:             0,
-						Format:               rm.GetResultFormatCode(resultColumn + 1),
+						Format:               0,
 					},
 				)
 				if len(e.Args) == 1 {
@@ -177,10 +165,10 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 							DataTypeSize:         1,
 							TableAttributeNumber: 0,
 							TableOID:             0,
-							Format:               rm.GetResultFormatCode(resultColumn),
+							Format:               0,
 						})
 
-					virtualRowVals = append(virtualRowVals, formatBool(rm.SPH.GetTsa() != config.TargetSessionAttrsRW, rm.GetResultFormatCode(resultColumn)))
+					virtualRowVals = append(virtualRowVals, formatTextBool(rm.SPH.GetTsa() != config.TargetSessionAttrsRW))
 
 					continue
 				}
@@ -225,7 +213,7 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 					DataTypeSize:         -1,
 					TableAttributeNumber: 0,
 					TableOID:             0,
-					Format:               rm.GetResultFormatCode(resultColumn),
+					Format:               0,
 				})
 
 			virtualRowVals = append(virtualRowVals, []byte(e.Value))
@@ -245,20 +233,10 @@ func PlanTargetList(ctx context.Context, rm *rmeta.RoutingMetadataContext, plr Q
 					DataTypeSize:         size,
 					TableAttributeNumber: 0,
 					TableOID:             0,
-					Format:               rm.GetResultFormatCode(resultColumn),
+					Format:               0,
 				})
 
-			var value []byte
-			if rm.GetResultFormatCode(resultColumn) == xproto.FormatCodeBinary {
-				if oid == catalog.INT4OID {
-					value = binary.BigEndian.AppendUint32(nil, uint32(e.Value))
-				} else {
-					value = binary.BigEndian.AppendUint64(nil, uint64(e.Value))
-				}
-			} else {
-				value = fmt.Appendf(nil, "%d", e.Value)
-			}
-			virtualRowVals = append(virtualRowVals, value)
+			virtualRowVals = append(virtualRowVals, fmt.Appendf(nil, "%d", e.Value))
 		case *lyx.AExprNConst, *lyx.AExprBConst:
 			p = plan.Combine(p, &plan.RandomDispatchPlan{})
 

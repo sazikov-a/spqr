@@ -241,6 +241,34 @@ type VirtualPlan struct {
 	OverwriteCC *pgproto3.CommandComplete
 	TTS         *tupleslot.TupleTableSlot
 	SubPlan     Plan
+
+	SubplanProjection *SubplanProjection
+}
+
+// SubplanProjection describes values consumed or added by a virtual output plan.
+// PrefixFields are generated locally before the subplan's result columns.
+type SubplanProjection struct {
+	ConsumeParameters bool
+	PrefixFields      tupleslot.TupleDesc
+}
+
+// Bind projects a copied portal request onto the physical subplan's shape.
+func (projection *SubplanProjection) Bind(bind pgproto3.Bind, parameterOIDs []uint32) (pgproto3.Bind, []uint32, error) {
+	if projection == nil {
+		return bind, parameterOIDs, nil
+	}
+	if projection.ConsumeParameters {
+		bind.Parameters = nil
+		bind.ParameterFormatCodes = nil
+		parameterOIDs = nil
+	}
+	if len(bind.ResultFormatCodes) > 1 {
+		if len(bind.ResultFormatCodes) < len(projection.PrefixFields) {
+			return pgproto3.Bind{}, nil, fmt.Errorf("bind has fewer result formats than locally generated columns")
+		}
+		bind.ResultFormatCodes = bind.ResultFormatCodes[len(projection.PrefixFields):]
+	}
+	return bind, parameterOIDs, nil
 }
 
 func (vp *VirtualPlan) ExecutionTargets() []kr.ShardKey {

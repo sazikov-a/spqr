@@ -43,19 +43,19 @@ func ReplyVirtualParamState(cl client.Client, name string, val []byte, formats .
 }
 
 func ReplyVirtualParamStateTTS(cl client.Client, tts *tupleslot.TupleTableSlot, formats ...int16) error {
-	fields, err := tts.Desc.WithResultFormats(formats)
+	formatted, err := tts.WithResultFormats(formats)
 	if err != nil {
 		return err
 	}
 	if err := cl.Send(
 		&pgproto3.RowDescription{
-			Fields: fields,
+			Fields: formatted.Desc,
 		},
 	); err != nil {
 		return err
 	}
 
-	for _, r := range tts.Raw {
+	for _, r := range formatted.Raw {
 		if err := cl.Send(
 			&pgproto3.DataRow{
 				Values: r,
@@ -69,7 +69,7 @@ func ReplyVirtualParamStateTTS(cl client.Client, tts *tupleslot.TupleTableSlot, 
 
 var errAbortedTx = fmt.Errorf("current transaction is aborted, commands ignored until end of transaction block")
 
-func (rst *RelayStateImpl) ProcQueryAdvancedTx(query string, binderQ func() error, doCaching bool) (*PortalDesc, error) {
+func (rst *RelayStateImpl) ProcQueryAdvancedTx(query string, binderQ func() error, doCaching bool, resultFormats []int16) (*PortalDesc, error) {
 
 	stmts, comment, err := rst.Parse(query, doCaching)
 	if err != nil {
@@ -129,7 +129,7 @@ l:
 
 		startTime := time.Now()
 
-		pd, err = rst.ProcQueryAdvanced(query, stmt, comment, binderQ, doCaching)
+		pd, err = rst.ProcQueryAdvanced(query, stmt, comment, binderQ, resultFormats)
 
 		spqrlog.SLogger.ReportStatement(spqrlog.StmtTypeQuery, query, time.Since(startTime))
 
@@ -172,8 +172,7 @@ var (
 // So, we need to process SETs, BEGINs, ROLLBACKs etc ourselves.
 // QueryStateExecutor provides set of function for either simple of extended protoc interactions
 // query param is either plain query from simple proto or bind query from x proto
-func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, comments []string, binderQ func() error, _ bool) (*PortalDesc, error) {
-
+func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, comments []string, binderQ func() error, formats []int16) (*PortalDesc, error) {
 	/* !!! Do not complete relay here (no TX status management) !!! */
 
 	spqrlog.Zero.Debug().Str("query", query).Str("txstatus", rst.qse.TxStatus().String()).Uint("client", rst.Client().ID()).Msgf("process relay state advanced: %+v", stmt)
@@ -339,7 +338,7 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 
 			tts.WriteDataRow(val)
 
-			if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+			if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, formats...); err != nil {
 				return nil, err
 			}
 
@@ -368,7 +367,7 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 
 			tts.WriteDataRow(val)
 
-			if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+			if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, formats...); err != nil {
 				return nil, err
 			}
 
@@ -397,7 +396,7 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 					tts.WriteDataRow("off")
 				}
 
-				if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+				if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, formats...); err != nil {
 					return nil, err
 				}
 
@@ -415,13 +414,13 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 				}
 				tts.WriteDataRow(string(rst.Client().CommitStrategy()))
 
-				if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, rst.localResultFormats...); err != nil {
+				if err := ReplyVirtualParamStateTTS(rst.Client(), &tts, formats...); err != nil {
 					return nil, err
 				}
 			default:
 
 				if strings.HasPrefix(param, "__spqr__") {
-					if err := ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]), rst.localResultFormats...); err != nil {
+					if err := ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]), formats...); err != nil {
 						return nil, err
 					}
 				} else {
@@ -431,7 +430,7 @@ func (rst *RelayStateImpl) ProcQueryAdvanced(query string, stmt lyx.Node, commen
 						return pd, err
 					}
 
-					if err := ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]), rst.localResultFormats...); err != nil {
+					if err := ReplyVirtualParamState(rst.Client(), param, []byte(rst.Client().Params()[param]), formats...); err != nil {
 						return nil, err
 					}
 				}

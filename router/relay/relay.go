@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -74,7 +75,7 @@ type RelayStateMgr interface {
 
 	PipelineCleanup()
 
-	ProcQueryAdvancedTx(query string, binderQ func() error, doCaching bool) (*PortalDesc, error)
+	ProcQueryAdvancedTx(query string, binderQ func() error, doCaching bool, resultFormats []int16) (*PortalDesc, error)
 }
 
 type PortalDesc struct {
@@ -114,9 +115,6 @@ type RelayStateImpl struct {
 	saveBind        pgproto3.Bind
 	saveBindNamed   map[string]*pgproto3.Bind
 	savedPortalDesc map[string]*PortalDesc
-
-	// Formats for local replies emitted synchronously while processing Bind.
-	localResultFormats []int16
 
 	WaitSync bool
 
@@ -699,8 +697,6 @@ func (rst *RelayStateImpl) describeDeployablePlan(
 	name string,
 	dMsg *pgproto3.Describe, p plan.Plan) (*PortalDesc, error) {
 
-	/* SingleShard or random shard plans */
-
 	err := rst.PrepareTargetDispatchExecutionSlice(p)
 	if err != nil {
 		return nil, err
@@ -718,8 +714,51 @@ func (rst *RelayStateImpl) describeDeployablePlan(
 
 	rst.routingDecisionPlan = p
 
-	if _, _, err := rst.gangDeployPrepStmtByName(bindName); err != nil {
-		return nil, err
+	serv := rst.Client().Server()
+	if serv == nil {
+		return nil, fmt.Errorf("failed to describe portal for unrouted client")
+	}
+	var targets []kr.ShardKey
+	if p != nil {
+		targets = p.ExecutionTargets()
+	}
+	var describeShard shard.ShardHostInstance
+	for _, active := range serv.Datashards() {
+		if len(targets) == 0 || slices.ContainsFunc(targets, func(key kr.ShardKey) bool {
+			return key.Name == active.SHKey().Name
+		}) {
+			describeShard = active
+			break
+		}
+	}
+	if describeShard == nil {
+		return nil, spqrerror.New(spqrerror.SPQR_NO_DATASHARD, "No active shard for portal description")
+	}
+
+	var parse *pgproto3.Parse
+	output, virtual := p.(*plan.VirtualPlan)
+	if virtual && output.SubPlan != nil {
+		query := output.SubPlan.GetGangMemberMsg(describeShard.SHKey())
+		if query == "" {
+			return nil, fmt.Errorf("output subplan has no query to describe")
+		}
+		def := rst.Client().PreparedStatementDefinitionByName(bindName)
+		if def == nil {
+			return nil, pstmtDoesNotExistsErr(bindName)
+		}
+		innerBind, parameterOIDs, err := output.SubplanProjection.Bind(*bnd, def.ParameterOIDs)
+		if err != nil {
+			return nil, err
+		}
+		innerBind.PreparedStatement = ""
+		innerBind.DestinationPortal = ""
+		bnd = &innerBind
+		parse = &pgproto3.Parse{Query: query, ParameterOIDs: parameterOIDs}
+		dMsg = &pgproto3.Describe{ObjectType: 'P'}
+	} else {
+		if _, _, err := rst.gangDeployPrepStmtByName(bindName); err != nil {
+			return nil, err
+		}
 	}
 
 	/* XXX: maybe optimize allocation here */
@@ -731,12 +770,25 @@ func (rst *RelayStateImpl) describeDeployablePlan(
 		}
 	}
 
-	cachedPd, err := sliceDescribePortal(rst.Client().Server(), dMsg, bnd)
+	cachedPd, err := sliceDescribePortal(serv, describeShard, dMsg, bnd, parse)
 	if err != nil {
 		return nil, err
 	}
 
-	rst.savedPortalDesc[bindName] = cachedPd
+	if virtual && output.SubplanProjection != nil {
+		if cachedPd.rd != nil {
+			fields := xproto.CopyFieldDescriptions(output.SubplanProjection.PrefixFields)
+			cachedPd.rd.Fields = append(fields, cachedPd.rd.Fields...)
+		}
+	} else {
+		if cachedPd.rd != nil {
+			// Statement metadata is independent of the first portal's formats.
+			for i := range cachedPd.rd.Fields {
+				cachedPd.rd.Fields[i].Format = 0
+			}
+		}
+		rst.savedPortalDesc[bindName] = cachedPd
+	}
 	return cachedPd, nil
 }
 
@@ -771,6 +823,10 @@ func (rst *RelayStateImpl) DescribePrepared(objType byte, name string, dMsg *pgp
 			Msg("Describe portal")
 
 		portDesc, ok := rst.savedPortalDesc[bindName]
+		if output, virtual := p.(*plan.VirtualPlan); virtual && output.SubplanProjection != nil {
+			// A consumed parameter can select a different relation and row shape.
+			ok = false
+		}
 
 		if !ok {
 			switch q := p.(type) {
@@ -913,6 +969,9 @@ func (rst *RelayStateImpl) BindPrepared(
 	if _, err := prepstatement.GetParams(parameterFormatCodes, parameters); err != nil {
 		return err
 	}
+	if err := tupleslot.ValidateResultFormatCodes(resultFormatCodes); err != nil {
+		return err
+	}
 
 	if def.OverwriteRemoveParamIDs != nil {
 		// we did query overwrite for sole reason -
@@ -962,16 +1021,12 @@ func (rst *RelayStateImpl) BindPrepared(
 		bnd = rst.saveBindNamed[destinationPortal]
 	}
 	bnd.DestinationPortal = destinationPortal
-	bnd.ResultFormatCodes = resultFormatCodes
-
-	previousLocalResultFormats := rst.localResultFormats
-	rst.localResultFormats = resultFormatCodes
-	defer func() { rst.localResultFormats = previousLocalResultFormats }()
+	// A portal owns its request independently of the frontend message buffer
+	// and of any other portal bound to the same statement.
+	bnd.ResultFormatCodes = slices.Clone(resultFormatCodes)
 
 	pd, err := rst.ProcQueryAdvancedTx(def.Query, func() error {
 		rm := rst.savedRM[preparedStatement]
-
-		rm.LastResultFormatCodes = resultFormatCodes
 
 		hash := rst.Client().PreparedStatementQueryHashByName(preparedStatement)
 
@@ -1048,7 +1103,7 @@ func (rst *RelayStateImpl) BindPrepared(
 
 		return nil
 
-	}, true /* cache parsing for prep statement */)
+	}, true /* cache parsing for prep statement */, bnd.ResultFormatCodes)
 
 	if err != nil {
 		return err

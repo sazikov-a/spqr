@@ -419,9 +419,7 @@ func (qr *ProxyQrouter) addAggregateToPlan(
 
 			datRow := make([][]byte, len(aggStates))
 			for i, agg := range aggStates {
-				format := rm.GetResultFormatCode(i)
-				retSlice.TTS.Desc[i].Format = format
-				datRow[i] = agg.Finalize(format)
+				datRow[i] = agg.Finalize(retSlice.TTS.Desc[i].Format)
 			}
 
 			retSlice.TTS.Raw = append(retSlice.TTS.Raw, datRow)

@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5/pgproto3"
-	"github.com/pg-sharding/spqr/pkg/models/spqrerror"
 	"github.com/pg-sharding/spqr/pkg/prepstatement"
 	"github.com/pg-sharding/spqr/pkg/shard"
 	"github.com/pg-sharding/spqr/router/server"
@@ -128,20 +127,19 @@ recvLoop:
 	return rd, retMsg, nil
 }
 
-func sliceDescribePortal(serv server.Server, portalDesc *pgproto3.Describe, bind *pgproto3.Bind) (*PortalDesc, error) {
+func sliceDescribePortal(serv server.Server, shard shard.ShardHostInstance, portalDesc *pgproto3.Describe, bind *pgproto3.Bind, parse *pgproto3.Parse) (*PortalDesc, error) {
 	if serv == nil {
 		return nil, fmt.Errorf("failed to describe portal for unrouted client")
 	}
 
-	shards := serv.Datashards()
-	if len(shards) == 0 {
-		return nil, spqrerror.New(spqrerror.SPQR_NO_DATASHARD, "No active shards")
-	}
-
-	shard := shards[0]
 	shardId := shard.ID()
 	shkey := shard.SHKey()
 
+	if parse != nil {
+		if err := serv.SendShard(parse, shkey); err != nil {
+			return nil, err
+		}
+	}
 	if err := serv.SendShard(bind, shkey); err != nil {
 		return nil, err
 	}
@@ -179,6 +177,10 @@ recvLoop:
 			return nil, err
 		}
 		switch q := msg.(type) {
+		case *pgproto3.ParseComplete:
+			if parse == nil {
+				return nil, fmt.Errorf("received unexpected ParseComplete while describing portal")
+			}
 		case *pgproto3.BindComplete:
 			// that's ok
 		case *pgproto3.ReadyForQuery:

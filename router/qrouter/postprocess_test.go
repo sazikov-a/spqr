@@ -21,15 +21,14 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
-func TestAggregatePostprocessingResultFormats(t *testing.T) {
+func TestAggregatePostprocessingPreservesBackendFormats(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		formats []int16
-		want    []int16
 	}{
-		{name: "text", want: []int16{0, 0}},
-		{name: "binary", formats: []int16{1}, want: []int16{1, 1}},
-		{name: "mixed", formats: []int16{1, 0}, want: []int16{1, 0}},
+		{name: "text", formats: []int16{0, 0}},
+		{name: "binary", formats: []int16{1, 1}},
+		{name: "mixed", formats: []int16{1, 0}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
@@ -46,15 +45,15 @@ func TestAggregatePostprocessingResultFormats(t *testing.T) {
 
 			stmt, _, err := lyx.Parse("SELECT count(*), count(v) FROM tab")
 			require.NoError(t, err)
-			rm := &rmeta.RoutingMetadataContext{Stmt: stmt[0], LastResultFormatCodes: tt.formats}
+			rm := &rmeta.RoutingMetadataContext{Stmt: stmt[0]}
 			qr := &ProxyQrouter{}
 			p, err := qr.addAggregateToPlan(context.Background(), rm, &plan.ScatterPlan{ExecTargets: keys})
 			require.NoError(t, err)
 			vp := p.(*plan.VirtualPlan)
 
-			fields := make([]pgproto3.FieldDescription, len(tt.want))
-			want := make([][]byte, len(tt.want))
-			for i, format := range tt.want {
+			fields := make([]pgproto3.FieldDescription, len(tt.formats))
+			want := make([][]byte, len(tt.formats))
+			for i, format := range tt.formats {
 				fields[i] = pgproto3.FieldDescription{DataTypeOID: catalog.INT8OID, Format: format}
 				if format == xproto.FormatCodeBinary {
 					want[i] = binary.BigEndian.AppendUint64(nil, 42)
@@ -63,8 +62,8 @@ func TestAggregatePostprocessingResultFormats(t *testing.T) {
 				}
 			}
 			for i, count := range []uint64{17, 25} {
-				values := make([][]byte, len(tt.want))
-				for j, format := range tt.want {
+				values := make([][]byte, len(tt.formats))
+				for j, format := range tt.formats {
 					if format == xproto.FormatCodeBinary {
 						values[j] = binary.BigEndian.AppendUint64(nil, count)
 					} else {

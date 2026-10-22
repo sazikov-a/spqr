@@ -1133,8 +1133,15 @@ func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Pl
 			/* XXX: Do all required job in sub-plan */
 			spqrlog.Zero.Debug().Uint("client", s.cl.ID()).Msg("executing sub plan")
 			var outputQuery *QueryDesc
-			if _, ok := topPlan.(*plan.VirtualPlan); ok {
+			if output, ok := topPlan.(*plan.VirtualPlan); ok {
 				outputQuery = qd
+				if bind, ok := qd.Msg.(*pgproto3.Bind); ok {
+					innerBind, parameterOIDs, err := output.SubplanProjection.Bind(*bind, qd.parameterOIDs)
+					if err != nil {
+						return err
+					}
+					outputQuery = &QueryDesc{Msg: &innerBind, parameterOIDs: parameterOIDs}
+				}
 			}
 			if err := s.executeInnerSlice(serv, sp, outputQuery); err != nil {
 				return err
@@ -1148,7 +1155,7 @@ func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Pl
 		/* execute logic without shard dispatch */
 
 		if q.TTS != nil {
-			fields, err := q.TTS.Desc.WithResultFormats(resultFormats)
+			output, err := q.TTS.WithResultFormats(resultFormats)
 			if err != nil {
 				return err
 			}
@@ -1156,14 +1163,14 @@ func (s *QueryStateExecutorImpl) executeSliceGuts(qd *QueryDesc, topPlan plan.Pl
 			if s.es.expectRowDesc {
 				if replyCl {
 					if err := s.Client().Send(&pgproto3.RowDescription{
-						Fields: fields,
+						Fields: output.Desc,
 					}); err != nil {
 						return err
 					}
 				}
 			}
 
-			for _, vals := range q.TTS.Raw {
+			for _, vals := range output.Raw {
 				if err := s.Client().Send(&pgproto3.DataRow{
 					Values: vals,
 				}); err != nil {

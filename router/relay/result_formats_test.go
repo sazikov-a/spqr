@@ -62,8 +62,7 @@ func TestExecuteVirtualResultFormats(t *testing.T) {
 			parsed, _, err := lyx.Parse("SELECT " + tt.literal + ", pg_is_in_recovery(), ''")
 			require.NoError(t, err)
 			rm := &rmeta.RoutingMetadataContext{
-				SPH:                   session.NewSimpleHandler(config.TargetSessionAttrsRW, false, ""),
-				LastResultFormatCodes: tt.formats,
+				SPH: session.NewSimpleHandler(config.TargetSessionAttrsRW, false, ""),
 			}
 			p, err := planner.PlanTargetList(context.Background(), rm, nil, parsed[0].(*lyx.Select))
 			require.NoError(t, err)
@@ -80,8 +79,11 @@ func TestExecuteVirtualResultFormats(t *testing.T) {
 			bind := &pgproto3.Bind{DestinationPortal: tt.portal, ResultFormatCodes: tt.formats}
 			require.NoError(t, BindAndReadSliceResult(rst, bind, nil, tt.portal, 0))
 			require.Equal(t, []pgproto3.BackendMessage{&pgproto3.DataRow{Values: tt.want}}, *replies)
-			// The planner produces the requested representation; execution forwards it.
-			require.Equal(t, tt.want, p.(*plan.VirtualPlan).TTS.Raw[0])
+			// Encoding a portal's result must not change the planner's text rows.
+			require.Equal(t, [][][]byte{{[]byte(tt.literal), []byte("f"), {}}}, p.(*plan.VirtualPlan).TTS.Raw)
+			for _, field := range p.(*plan.VirtualPlan).TTS.Desc {
+				require.Zero(t, field.Format)
+			}
 		})
 	}
 }

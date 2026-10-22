@@ -9,6 +9,7 @@ import (
 	"github.com/pg-sharding/spqr/pkg/prepstatement"
 	"github.com/pg-sharding/spqr/pkg/session"
 	"github.com/pg-sharding/spqr/pkg/session/sessiontest"
+	"github.com/pg-sharding/spqr/pkg/tupleslot"
 	mockcl "github.com/pg-sharding/spqr/router/mock/client"
 	mockpm "github.com/pg-sharding/spqr/router/mock/poolmgr"
 	"github.com/stretchr/testify/require"
@@ -58,11 +59,10 @@ func TestLocalShowResultFormats(t *testing.T) {
 				savedPortalDesc: map[string]*PortalDesc{},
 			}
 			require.NoError(t, rst.BindPrepared(context.Background(), "s", "", nil, nil, []int16{1}))
-			require.Nil(t, rst.localResultFormats)
 			_, err := rst.ProcQueryAdvancedTx(query, func() error {
 				t.Fatal("local SHOW should not dispatch to a backend")
 				return nil
-			}, false)
+			}, false, nil)
 			require.NoError(t, err)
 			require.Len(t, descriptions, 2)
 			require.Equal(t, int16(1), descriptions[0].Fields[0].Format)
@@ -91,7 +91,27 @@ func TestReplyVirtualParamStateNullAndEmpty(t *testing.T) {
 	}
 }
 
-func TestLocalShowRestoresResultFormatsOnError(t *testing.T) {
+func TestReplyVirtualParamStateTTSResultFormats(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	cl := mockcl.NewMockRouterClient(ctrl)
+	tts := &tupleslot.TupleTableSlot{
+		Desc: tupleslot.TupleDesc{{Name: []byte("value"), DataTypeOID: 23}},
+		Raw:  [][][]byte{{[]byte("42")}},
+	}
+	cl.EXPECT().Send(gomock.Any()).DoAndReturn(func(msg pgproto3.BackendMessage) error {
+		require.Equal(t, int16(1), msg.(*pgproto3.RowDescription).Fields[0].Format)
+		return nil
+	})
+	cl.EXPECT().Send(gomock.Any()).DoAndReturn(func(msg pgproto3.BackendMessage) error {
+		require.Equal(t, [][]byte{{0, 0, 0, 42}}, msg.(*pgproto3.DataRow).Values)
+		return nil
+	})
+	require.NoError(t, ReplyVirtualParamStateTTS(cl, tts, 1))
+	require.Equal(t, int16(0), tts.Desc[0].Format)
+	require.Equal(t, [][][]byte{{[]byte("42")}}, tts.Raw)
+}
+
+func TestLocalShowErrorDoesNotAffectSimpleResultFormats(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	cl := mockcl.NewMockRouterClient(ctrl)
 	pm := mockpm.NewMockPoolMgr(ctrl)
@@ -99,13 +119,30 @@ func TestLocalShowRestoresResultFormatsOnError(t *testing.T) {
 	cl.EXPECT().ID().AnyTimes().Return(uint(1))
 	cl.EXPECT().PreparedStatementDefinitionByName("s").Return(&prepstatement.PreparedStatementDefinition{Name: "s", Query: "SHOW __spqr__custom"})
 	cl.EXPECT().ReplyBindComplete().Return(nil)
-	cl.EXPECT().Params().Return(map[string]string{"__spqr__custom": "value"})
+	cl.EXPECT().Params().Times(2).Return(map[string]string{"__spqr__custom": "value"})
 	wantErr := errors.New("client disconnected")
-	cl.EXPECT().Send(gomock.Any()).Return(wantErr)
+	gomock.InOrder(
+		cl.EXPECT().Send(gomock.Any()).DoAndReturn(func(msg pgproto3.BackendMessage) error {
+			require.Equal(t, int16(1), msg.(*pgproto3.RowDescription).Fields[0].Format)
+			return wantErr
+		}),
+		cl.EXPECT().Send(gomock.Any()).DoAndReturn(func(msg pgproto3.BackendMessage) error {
+			require.Equal(t, int16(0), msg.(*pgproto3.RowDescription).Fields[0].Format)
+			return nil
+		}),
+		cl.EXPECT().Send(gomock.Any()).DoAndReturn(func(msg pgproto3.BackendMessage) error {
+			require.Equal(t, [][]byte{[]byte("value")}, msg.(*pgproto3.DataRow).Values)
+			return nil
+		}),
+	)
 	rst := &RelayStateImpl{
 		Cl:  cl,
 		qse: NewQueryStateExecutor(nil, nil, pm, cl),
 	}
 	require.ErrorIs(t, rst.BindPrepared(context.Background(), "s", "", nil, nil, []int16{1}), wantErr)
-	require.Nil(t, rst.localResultFormats)
+	_, err := rst.ProcQueryAdvancedTx("SHOW __spqr__custom", func() error {
+		t.Fatal("local SHOW should not dispatch to a backend")
+		return nil
+	}, false, nil)
+	require.NoError(t, err)
 }

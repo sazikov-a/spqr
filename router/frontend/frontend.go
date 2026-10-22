@@ -185,7 +185,7 @@ func ProcessMessage(rst relay.RelayStateMgr, msg pgproto3.FrontendMessage) error
 		_, err := rst.ProcQueryAdvancedTx(q.String, func() error {
 			// this call completes relay, sends RFQ
 			return rst.ProcessSimpleQuery(q, true)
-		}, false)
+		}, false, nil)
 
 		if err == nil {
 			/* Okay, respond with CommandComplete first. */
